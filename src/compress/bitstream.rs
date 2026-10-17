@@ -38,10 +38,22 @@ pub(crate) enum Symbol {
     },
 }
 
+// Literal offsets address a virtual concatenation of saved bytes and the current
+// input window. Both sources stay alive until this block has been encoded.
+#[inline(always)]
+fn literal_run<'a>(saved: &'a [u8], input: &'a [u8], start: u32, end: u32) -> &'a [u8] {
+    if end as usize <= saved.len() {
+        &saved[start as usize..end as usize]
+    } else {
+        &input[start as usize - saved.len()..end as usize - saved.len()]
+    }
+}
+
 pub(crate) fn write_block<W: Write>(
     writer: &mut BitWriter<W>,
-    data: &[u8],
-    base_index: u32,
+    saved_literals: &[u8],
+    input: &[u8],
+    raw: Option<&[u8]>,
     symbols: &[Symbol],
     eof: bool,
 ) -> io::Result<()> {
@@ -56,8 +68,7 @@ pub(crate) fn write_block<W: Write>(
     for symbol in symbols {
         match symbol {
             Symbol::LiteralRun { start, end } => {
-                let mut chunks = data[(*start - base_index) as usize..(*end - base_index) as usize]
-                    .chunks_exact(4);
+                let mut chunks = literal_run(saved_literals, input, *start, *end).chunks_exact(4);
                 for chunk in &mut chunks {
                     frequencies[chunk[0] as usize] += 1;
                     f2[chunk[1] as usize] += 1;
@@ -116,8 +127,8 @@ pub(crate) fn write_block<W: Write>(
         7,
     );
 
-    // Compare every block against stored encoding. Histogram costs avoid a second
-    // traversal of literal bytes, and the stored alternative bounds expansion.
+    // Compare complete encoding costs. Fixed codes bound output even when the
+    // input window no longer contains the raw bytes for stored encoding.
     let mut dynamic_cost = 3 + 14 + 19 * 3;
     for &length in lengths[..num_litlen_codes]
         .iter()
@@ -148,20 +159,22 @@ pub(crate) fn write_block<W: Write>(
         .sum();
     dynamic_cost += extra_bits;
     fixed_cost += extra_bits;
-    let stored_blocks = data.len().div_ceil(u16::MAX as usize).max(1);
-    let padding = (8 - (writer.buffered_bits() as u64 + 3) % 8) % 8;
-    let stored_cost = data.len() as u64 * 8 + 3 + padding + 32 + (stored_blocks as u64 - 1) * 40;
-    if stored_cost <= dynamic_cost && stored_cost <= fixed_cost {
-        // A logical block can require several 65535-byte stored blocks.
-        for (i, chunk) in data.chunks(u16::MAX as usize).enumerate() {
-            writer.write_bits(u64::from(eof && i + 1 == stored_blocks), 3)?;
-            let destination = writer.flush()?;
-            let len = chunk.len() as u16;
-            destination.write_all(&len.to_le_bytes())?;
-            destination.write_all(&(!len).to_le_bytes())?;
-            destination.write_all(chunk)?;
+    if let Some(data) = raw {
+        let stored_blocks = data.len().div_ceil(u16::MAX as usize).max(1);
+        let padding = (8 - (writer.buffered_bits() as u64 + 3) % 8) % 8;
+        let stored_cost =
+            data.len() as u64 * 8 + 3 + padding + 32 + (stored_blocks as u64 - 1) * 40;
+        if stored_cost <= dynamic_cost && stored_cost <= fixed_cost {
+            for (i, chunk) in data.chunks(u16::MAX as usize).enumerate() {
+                writer.write_bits(u64::from(eof && i + 1 == stored_blocks), 3)?;
+                let destination = writer.flush()?;
+                let len = chunk.len() as u16;
+                destination.write_all(&len.to_le_bytes())?;
+                destination.write_all(&(!len).to_le_bytes())?;
+                destination.write_all(chunk)?;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     let use_fixed_block = fixed_cost < dynamic_cost;
 
@@ -205,8 +218,7 @@ pub(crate) fn write_block<W: Write>(
     for symbol in symbols {
         match symbol {
             Symbol::LiteralRun { start, end } => {
-                let mut groups = data[(*start - base_index) as usize..(*end - base_index) as usize]
-                    .chunks_exact(4);
+                let mut groups = literal_run(saved_literals, input, *start, *end).chunks_exact(4);
                 for group in &mut groups {
                     let code0 = codes[group[0] as usize] as u64;
                     let code1 = codes[group[1] as usize] as u64;

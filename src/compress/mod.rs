@@ -179,6 +179,17 @@ impl CompressorInner {
         }
     }
 
+    fn pending_bits(&self) -> usize {
+        match self {
+            Self::Uncompressed => 0,
+            Self::Rle(p) => p.pending_bits(),
+            Self::Fast(p) => p.pending_bits(),
+            Self::MediumFast(p) => p.pending_bits(),
+            Self::Medium(p) => p.pending_bits(),
+            Self::High(p) => p.pending_bits(),
+        }
+    }
+
     fn reset(&mut self) {
         match self {
             Self::Uncompressed => {}
@@ -198,7 +209,7 @@ impl CompressorInner {
         start: usize,
         flush: Flush,
     ) -> std::io::Result<usize> {
-        if flush == Flush::Finish && input.len() == start {
+        if matches!(self, Self::Uncompressed) && flush == Flush::Finish && input.len() == start {
             writer.write_bits(3, 10)?;
             writer.flush()?;
             return Ok(0);

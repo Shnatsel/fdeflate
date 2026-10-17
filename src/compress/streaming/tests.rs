@@ -85,6 +85,113 @@ fn cross_decoder_levels_chunking_and_history() {
 }
 
 #[test]
+fn one_block_survives_window_slides_rebasing_and_empty_finish() {
+    let mut input = random(1024 * 1024);
+    for i in 8192..input.len() {
+        input[i] = input[i - 8192];
+    }
+    for level in [1, 6, 9] {
+        for zlib in [false, true] {
+            let mut encoder = StreamingCompressor::new(level, zlib);
+            let capacities = (encoder.input.data.capacity(), encoder.pending.capacity());
+            let mut output = vec![0; OUTPUT_CAPACITY];
+            let mut encoded = Vec::new();
+            for chunk in input.chunks(BATCH_SIZE) {
+                let p = encoder.process(chunk, &mut output, CompressionFlush::None);
+                assert_eq!(p.consumed, chunk.len());
+                assert_eq!(p.status.unwrap(), CompressionStatus::NeedsInput);
+                encoded.extend_from_slice(&output[..p.produced]);
+                // Tokens and saved literal bytes must survive rebasing too.
+                encoder.rebase();
+                assert_eq!(
+                    capacities,
+                    (encoder.input.data.capacity(), encoder.pending.capacity())
+                );
+            }
+            assert_eq!(encoded.len(), if zlib { 2 } else { 0 });
+            encoded.extend(compress(&mut encoder, &[], 1, 1));
+            // The first DEFLATE block is final: sliding the input window did
+            // not force any intervening Huffman blocks.
+            assert_eq!(encoded[if zlib { 2 } else { 0 }] & 1, 1);
+            assert_eq!(decode(&encoded, zlib), input);
+        }
+    }
+}
+
+#[test]
+fn token_limit_applies_to_repetitive_input_without_a_flush() {
+    let input = vec![b'A'; 8 * 1024 * 1024];
+    for level in [1, 6, 9] {
+        let mut encoder = StreamingCompressor::new(level, false);
+        let mut output = [0; 1];
+        let p = encoder.process(&input, &mut output, CompressionFlush::None);
+        assert_eq!(p.status.unwrap(), CompressionStatus::NeedsOutput);
+        assert!(p.consumed > BATCH_SIZE && p.consumed < input.len());
+        assert_eq!(p.produced, 1);
+        assert_eq!(output[0] & 1, 0);
+        let mut encoded = output.to_vec();
+        encoded.extend(compress(&mut encoder, &input[p.consumed..], 65537, 127));
+        assert_eq!(decode(&encoded, false), input);
+    }
+}
+
+#[test]
+fn literal_budget_splits_blocks_after_the_raw_prefix_has_left_the_window() {
+    let mut input = random(1024 * 1024);
+    let text = b"literal storage is bounded independently of match tokens\n";
+    for (i, byte) in input.iter_mut().enumerate() {
+        if i % 32768 >= 16384 {
+            *byte = text[i % text.len()];
+        }
+    }
+    for level in 1..=9 {
+        let mut encoder = StreamingCompressor::new(level, false);
+        let mut output = [0; 1];
+        let p = encoder.process(&input, &mut output, CompressionFlush::None);
+        assert_eq!(p.status.unwrap(), CompressionStatus::NeedsOutput);
+        assert!(p.consumed > BATCH_SIZE && p.consumed < input.len());
+        assert_eq!(p.produced, 1);
+        let mut encoded = output.to_vec();
+        encoded.extend(compress(&mut encoder, &input[p.consumed..], 70003, 131));
+        assert_eq!(decode(&encoded, false), input);
+    }
+}
+
+#[test]
+fn flushes_drain_saved_blocks_and_full_flush_restarts_history() {
+    let input = b"saved literals and repeated matches across input batches\n".repeat(6000);
+    for level in [1, 6, 9] {
+        for flush in [
+            CompressionFlush::Partial,
+            CompressionFlush::Sync,
+            CompressionFlush::Full,
+        ] {
+            let mut encoder = StreamingCompressor::new(level, false);
+            let p = encoder.process(&input, &mut [0; 1], CompressionFlush::None);
+            assert_eq!(p.consumed, input.len());
+            assert_eq!(p.produced, 0);
+            assert_eq!(p.status.unwrap(), CompressionStatus::NeedsInput);
+            let mut encoded = Vec::new();
+            loop {
+                let mut output = [0; 1];
+                let p = encoder.process(&[], &mut output, flush);
+                encoded.extend_from_slice(&output[..p.produced]);
+                if p.status.unwrap() == CompressionStatus::FlushComplete {
+                    break;
+                }
+                assert_ne!(p.produced, 0);
+            }
+            let suffix = compress(&mut encoder, &input, 70003, 23);
+            if flush == CompressionFlush::Full {
+                assert_eq!(decode(&suffix, false), input);
+            }
+            encoded.extend(suffix);
+            assert_eq!(decode(&encoded, false), input.repeat(2));
+        }
+    }
+}
+
+#[test]
 fn incompressible_stream_is_bounded_and_emitted_before_finish() {
     let input = random(BATCH_SIZE);
     let mut encoder = StreamingCompressor::new(6, false);
@@ -254,7 +361,14 @@ fn long_stream_rebases_without_overflow() {
                     assert_eq!(result.status, Err(miniz_oxide::MZError::Buf));
                     break;
                 }
-                assert_eq!(result.status, Ok(miniz_oxide::MZStatus::Ok));
+                if result.status == Err(miniz_oxide::MZError::Buf) {
+                    // An empty-input drain can produce buffered output and
+                    // report input starvation in the same miniz call.
+                    assert!(!finished);
+                    assert_eq!(position, bytes.len());
+                } else {
+                    assert_eq!(result.status, Ok(miniz_oxide::MZStatus::Ok));
+                }
             }
             assert_eq!(position, bytes.len());
         };

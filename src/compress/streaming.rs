@@ -8,18 +8,23 @@ use std::{
 };
 
 use super::{
-    bitwriter::BitState, parse::SYMBOL_LIMIT, BitWriter, CompressorInner, Flush, InputStream,
-    RleParser, WINDOW_SIZE,
+    bitwriter::BitState,
+    parse::{LITERAL_LIMIT, SYMBOL_CAPACITY},
+    BitWriter, CompressorInner, Flush, InputStream, RleParser, WINDOW_SIZE,
 };
 
 const BATCH_SIZE: usize = 128 * 1024;
 const INPUT_CAPACITY: usize = WINDOW_SIZE + BATCH_SIZE;
-// Each symbol describes at least one input byte. Symbol-triggered blocks have
-// at least 16384 symbols, and each may need an additional stored block header.
-// Reserve headers for those splits, the 65535-byte stored-block limit, and all
-// wrapper/flush framing. Every block chooses an encoding no larger than stored.
+const STORED_OUTPUT_CAPACITY: usize = BATCH_SIZE + 5 * BATCH_SIZE.div_ceil(65535) + 64;
+// Fixed Huffman codes cost at most 9 bits per literal and 31 per backref.
+// Pending tokens plus one input batch bound all output from one parser call:
+// a new backref costs at most 9 bits per input byte it represents, too.
+// At most nine symbol-limited blocks, two literal-limited blocks and the final
+// block can finish in a batch. 64 bytes cover their framing, buffered bits,
+// alignment, flush markers and the wrapper checksum. Stored/dynamic encodings
+// are selected only when their complete bit cost is no greater than fixed.
 const OUTPUT_CAPACITY: usize =
-    BATCH_SIZE + 5 * (BATCH_SIZE / 65535 + BATCH_SIZE / SYMBOL_LIMIT + 3) + 64;
+    (9 * (LITERAL_LIMIT + BATCH_SIZE) + 31 * SYMBOL_CAPACITY).div_ceil(8) + 64;
 
 #[cfg(test)]
 mod tests;
@@ -122,7 +127,7 @@ struct Pending<'a>(&'a mut Vec<u8>);
 impl Write for Pending<'_> {
     #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        assert!(self.0.len() + bytes.len() <= OUTPUT_CAPACITY);
+        assert!(self.0.len() + bytes.len() <= self.0.capacity());
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -173,7 +178,11 @@ impl StreamingCompressor {
                 written: 0,
             },
             bits: BitState::default(),
-            pending: Vec::with_capacity(OUTPUT_CAPACITY),
+            pending: Vec::with_capacity(if window_size == 0 {
+                STORED_OUTPUT_CAPACITY
+            } else {
+                OUTPUT_CAPACITY
+            }),
             pending_pos: 0,
             checksum: zlib.then(Adler32::new),
             window_size,
@@ -340,7 +349,12 @@ impl StreamingCompressor {
     fn emit<O: Output + ?Sized>(&mut self, output: &mut O, produced: &mut usize, flush: Flush) {
         debug_assert!(self.pending.is_empty());
         let raw = self.input.data.len() - self.input.written;
-        let bound = raw + 5 * (raw / 65535 + raw / SYMBOL_LIMIT + 3) + 64;
+        let bound = if self.window_size == 0 {
+            raw + 5 * raw.div_ceil(65535) + 64
+        } else {
+            (self.inner.pending_bits() + 9 * raw).div_ceil(8) + 64
+        };
+        debug_assert!(bound <= OUTPUT_CAPACITY);
         if output.len() - *produced >= bound {
             encode_batch(
                 &mut self.inner,
@@ -399,7 +413,7 @@ fn encode_batch<W: Write>(
                 .expect("infallible destination");
         }
     } else if flush == Flush::Batch {
-        // Release complete bytes without alignment or an extra flush block.
+        // Release complete bytes of any blocks emitted during this batch.
         writer.partial_flush().expect("infallible destination");
     }
     *bits = writer.state();
