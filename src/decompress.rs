@@ -137,6 +137,13 @@ enum State {
     Done,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ReadStatus {
+    NeedsInput,
+    NeedsOutput,
+    Done,
+}
+
 /// Decompressor for arbitrary zlib or raw deflate streams.
 pub struct Decompressor {
     /// State for decoding a compressed block.
@@ -243,6 +250,11 @@ impl Decompressor {
     /// - The output is full but there are more bytes to output.
     /// - The deflate stream is complete (and `is_done` will return true).
     ///
+    /// Pass any unconsumed input again on the next call. Bytes after the end of the stream are
+    /// not consumed, including when decoding across multiple calls. A full output buffer does
+    /// not prevent reading an end marker, empty blocks, or the zlib checksum: an exactly sized
+    /// output buffer is sufficient to finish decoding a stream.
+    ///
     /// To detect whether the zlib stream was truncated before the final checksum, call the
     /// `is_done` method after all input data has been consumed and no more data is written. If it
     /// returns false, then the stream was truncated.
@@ -261,8 +273,6 @@ impl Decompressor {
         }
 
         assert!(output_position <= output.len());
-
-        self.bits.mark_committed();
 
         let mut remaining_input = input;
         let mut output_index = output_position;
@@ -297,14 +307,12 @@ impl Decompressor {
         }
 
         // Main decoding state machine.
-        let mut last_state = None;
-        while last_state != Some(self.state) {
-            last_state = Some(self.state);
+        let status = loop {
             match self.state {
                 State::ZlibHeader => {
                     self.bits.fill_buffer(&mut remaining_input);
                     if self.bits.nbits < 16 {
-                        break;
+                        break ReadStatus::NeedsInput;
                     }
 
                     let input0 = self.bits.peek_bits(8);
@@ -322,15 +330,24 @@ impl Decompressor {
                 }
                 State::BlockHeader => {
                     self.read_block_header(&mut remaining_input)?;
+                    if self.state == State::BlockHeader {
+                        break ReadStatus::NeedsInput;
+                    }
                 }
                 State::CodeLengthCodes => {
                     self.read_code_length_codes(&mut remaining_input)?;
+                    if self.state == State::CodeLengthCodes {
+                        break ReadStatus::NeedsInput;
+                    }
                 }
                 State::CodeLengths => {
                     self.read_code_lengths(&mut remaining_input)?;
+                    if self.state == State::CodeLengths {
+                        break ReadStatus::NeedsInput;
+                    }
                 }
                 State::CompressedData => {
-                    let (compresed_block_status, new_output_index) =
+                    let (compressed_block_status, new_output_index) =
                         self.compression.read_compressed(
                             &mut self.bits,
                             &mut remaining_input,
@@ -339,11 +356,15 @@ impl Decompressor {
                             &mut self.queued_output,
                         )?;
                     output_index = new_output_index;
-                    if compresed_block_status == CompressedBlockStatus::ReachedEndOfBlock {
-                        self.state = match self.last_block {
-                            true => self.final_block_state(),
-                            false => State::BlockHeader,
-                        };
+                    match compressed_block_status {
+                        CompressedBlockStatus::NeedsInput => break ReadStatus::NeedsInput,
+                        CompressedBlockStatus::NeedsOutput => break ReadStatus::NeedsOutput,
+                        CompressedBlockStatus::ReachedEndOfBlock => {
+                            self.state = match self.last_block {
+                                true => self.final_block_state(),
+                                false => State::BlockHeader,
+                            };
+                        }
                     }
                 }
                 State::UncompressedData => {
@@ -379,6 +400,10 @@ impl Decompressor {
                         } else {
                             State::BlockHeader
                         };
+                    } else if output_index == output.len() {
+                        break ReadStatus::NeedsOutput;
+                    } else {
+                        break ReadStatus::NeedsInput;
                     }
                 }
                 State::Checksum => {
@@ -399,25 +424,31 @@ impl Decompressor {
                         }
                         self.state = State::Done;
                         self.bits.consume_bits(32);
-                        break;
+                        break ReadStatus::Done;
                     }
+                    break ReadStatus::NeedsInput;
                 }
-                State::Done => break,
+                State::Done => break ReadStatus::Done,
             }
-        }
+        };
 
         self.update_checksum(output, output_position, output_index);
 
         let mut consumed = input.len() - remaining_input.len();
-        if self.state == State::Done || output_index == output.len() {
-            // `fill_buffer` may have pulled whole bytes that were not needed before this return
-            // boundary. Keep already-committed bits and any partially consumed byte, but report
-            // uncommitted whole bytes as unread so the caller can process them later.
-            let unread_bytes = self.bits.rewind_uncommitted_whole_bytes();
-            debug_assert!(consumed >= unread_bytes);
-            consumed -= unread_bytes;
-        } else {
-            self.bits.mark_committed();
+        match status {
+            ReadStatus::NeedsInput => {
+                // Partial headers and end markers must survive even when output is full.
+                debug_assert!(remaining_input.is_empty());
+            }
+            ReadStatus::NeedsOutput | ReadStatus::Done => {
+                if status == ReadStatus::Done {
+                    // Any trailing whole bytes must come from this call, never an earlier one.
+                    debug_assert!(self.bits.nbits as usize / 8 <= consumed);
+                } else {
+                    debug_assert_eq!(output_index, output.len());
+                }
+                consumed -= self.bits.rewind_whole_bytes(consumed);
+            }
         }
 
         Ok((consumed, output_index - output_position))
@@ -702,8 +733,11 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
     }
 
     /// Returns:
-    /// - Whether this compressed block ended or not
+    /// - Whether decoding needs input, needs output, or reached the end of this block
     /// - The new value of `output_index`
+    // Keep these loops separate from the outer header/state machinery. Inlining them into
+    // Decompressor::read substantially reduces literal throughput in the decode benchmarks.
+    #[inline(never)]
     fn read_compressed(
         &self,
         bit_buffer: &mut BitBuffer,
@@ -1102,15 +1136,34 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
             output_index += copy_length;
         }
 
-        if queued_output.is_none()
-            && bit_buffer.nbits >= self.eof_bits
-            && bit_buffer.peek_bits(self.eof_bits) as u16 == self.eof_code
-        {
+        if output_index < output.len() {
+            // With output space available the careful loop already handles end markers. Its
+            // only successful stopping condition is insufficient input; do not refill again.
+            return Ok((CompressedBlockStatus::NeedsInput, output_index));
+        }
+        if queued_output.is_some() {
+            return Ok((CompressedBlockStatus::NeedsOutput, output_index));
+        }
+
+        // The last literal can fill output before the careful loop gets to refill. We still
+        // need to recognize the end marker, without requiring any spare output space.
+        bit_buffer.fill_buffer(remaining_input);
+        let missing_bits = self.eof_bits.saturating_sub(bit_buffer.nbits);
+        let prefix_mask = self.eof_mask >> missing_bits;
+        let matches_eof = (bit_buffer.buffer as u16 ^ self.eof_code) & prefix_mask == 0;
+        if matches_eof && missing_bits == 0 {
             bit_buffer.consume_bits(self.eof_bits);
             return Ok((CompressedBlockStatus::ReachedEndOfBlock, output_index));
         }
 
-        Ok((CompressedBlockStatus::MoreDataPresent, output_index))
+        // An incomplete matching prefix might still be an end marker. Buffer it until more
+        // input arrives; rewinding it just because output is full would prevent progress.
+        let status = if !matches_eof {
+            CompressedBlockStatus::NeedsOutput
+        } else {
+            CompressedBlockStatus::NeedsInput
+        };
+        Ok((status, output_index))
     }
 }
 
@@ -1118,7 +1171,6 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
 struct BitBuffer {
     buffer: u64,
     nbits: u8,
-    committed_bits: u8,
 }
 
 impl BitBuffer {
@@ -1126,39 +1178,25 @@ impl BitBuffer {
         Self {
             buffer: 0,
             nbits: 0,
-            committed_bits: 0,
         }
     }
 
-    /// Mark the currently buffered bits as already reported in a previous consumed count.
+    /// Return unused whole bytes from this call when output is blocked or the stream is done.
+    /// Never rewind on input starvation: the next call needs the buffered prefix to progress.
     ///
-    /// Later calls to `rewind_uncommitted_whole_bytes` will preserve these bits so we do not
-    /// subtract bytes that the caller has already been told were consumed.
+    /// Bits are consumed in order. If any bits from an earlier call remain, every byte fetched
+    /// this call is still buffered. Otherwise all remaining bits came from this call. Thus the
+    /// minimum of the buffered whole bytes and this call's input advance is exactly the number
+    /// we can return. Direct stored-block copies also count towards the advance, but can only
+    /// happen after draining the bit buffer, so they cannot invalidate this reasoning.
     #[inline]
-    fn mark_committed(&mut self) {
-        self.committed_bits = self.nbits;
-    }
-
-    /// Return whole bytes read into the bit buffer during this `read` call back to the caller.
-    ///
-    /// This should only be used at return boundaries where the decoder does not need more input to
-    /// make progress, such as when the output buffer is full or the stream is complete. On
-    /// input-starved returns, buffered bytes must stay committed so later calls can combine them
-    /// with new input for multi-byte headers, Huffman lookups, and checksum parsing.
-    #[inline]
-    fn rewind_uncommitted_whole_bytes(&mut self) -> usize {
-        debug_assert!(self.committed_bits <= self.nbits);
-
-        let uncommitted_bits = self.nbits - self.committed_bits;
-        let unread_bytes = uncommitted_bits / 8;
-        if unread_bytes != 0 {
-            let keep_bits = self.nbits - unread_bytes * 8;
-            self.buffer &= (1u64 << keep_bits).wrapping_sub(1);
-            self.nbits = keep_bits;
-        }
-
-        self.mark_committed();
-        unread_bytes as usize
+    fn rewind_whole_bytes(&mut self, input_advanced: usize) -> usize {
+        let unread_bytes = (self.nbits as usize / 8).min(input_advanced);
+        self.nbits -= unread_bytes as u8 * 8;
+        // Also clear speculative bits above nbits from fill_buffer's eight-byte load, even if
+        // no counted bytes were rewound. Unconsumed input belongs to the caller.
+        self.buffer &= (1u64 << self.nbits) - 1;
+        unread_bytes
     }
 
     fn fill_buffer(&mut self, input: &mut &[u8]) {
@@ -1189,7 +1227,6 @@ impl BitBuffer {
         debug_assert!(self.nbits >= nbits);
         self.buffer >>= nbits;
         self.nbits -= nbits;
-        self.committed_bits = self.committed_bits.saturating_sub(nbits);
     }
 }
 
@@ -1201,7 +1238,8 @@ enum QueuedOutput {
 
 #[derive(Debug, Eq, PartialEq)]
 enum CompressedBlockStatus {
-    MoreDataPresent,
+    NeedsInput,
+    NeedsOutput,
     ReachedEndOfBlock,
 }
 
@@ -1685,6 +1723,7 @@ mod tests {
         assert_eq!(&output[..output_index], input);
     }
 
+    mod streaming;
     mod test_utils;
     use tables::FIXED_CODE_LENGTHS;
     use test_utils::{decompress_by_chunks, TestDecompressionError};
