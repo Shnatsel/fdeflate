@@ -45,6 +45,11 @@ compressed bytes and compression ratio compared with the previous writer API.
 After an underlying writer error it must be discarded. For resumable output
 backpressure, use `StreamingCompressor` and retain any bytes not yet written.
 
+`Decompressor::read_progress` reports consumed and produced counts even on an
+error. Its output prefix must contain the previous 32 KiB of history (or all
+previous output if shorter), as with `read`. A decoding error remains terminal
+until `reset`.
+
 <!-- Internally, `fdeflate` (like other compression libraries) maps different compression levels to different algorithms and parameters. -->
 
 [Preliminary benchmark data](https://github.com/image-rs/fdeflate/discussions/68) shows that `fdeflate` meaningfully outperforms `zlib-rs` for levels 1-3 and is slightly better for levels 4-7. Levels 8 and 9 aren't yet implemented.
