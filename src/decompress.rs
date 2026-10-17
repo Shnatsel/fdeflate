@@ -117,6 +117,9 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
     }
 
     fn reset(&mut self) {
+        // Leave the primary tables intact: Decompressor::reset also resets the decoding state
+        // and clears fixed_table, so both tables are rebuilt before compressed data is decoded.
+        // Clearing them here would add redundant writes.
         self.secondary_table.clear();
         self.dist_secondary_table.clear();
         self.eof_code = 0;
