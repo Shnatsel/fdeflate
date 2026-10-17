@@ -7,6 +7,9 @@ pub(crate) struct RleParser {
 }
 
 impl RleParser {
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
     pub fn new(skip_ahead_shift: u8) -> Self {
         Self {
             inner: ParserInner::new(skip_ahead_shift, NullMatchFinder),

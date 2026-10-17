@@ -1,23 +1,35 @@
 use std::io::{self, Write};
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct BitState {
+    buffer: u64,
+    nbits: u8,
+}
+
 pub(super) struct BitWriter<W: Write> {
     buffer: u64,
     nbits: u8,
     writer: W,
 }
 impl<W: Write> BitWriter<W> {
-    pub fn new(writer: W) -> Self {
+    pub fn with_state(writer: W, state: BitState) -> Self {
         Self {
-            buffer: 0,
-            nbits: 0,
+            buffer: state.buffer,
+            nbits: state.nbits,
             writer,
+        }
+    }
+
+    pub fn state(&self) -> BitState {
+        BitState {
+            buffer: self.buffer,
+            nbits: self.nbits,
         }
     }
 
     pub fn buffered_bits(&self) -> u8 {
         self.nbits
     }
-
     #[inline(always)]
     pub fn write_bits(&mut self, bits: u64, nbits: u8) -> io::Result<()> {
         debug_assert!(nbits <= 64);
@@ -60,18 +72,5 @@ impl<W: Write> BitWriter<W> {
             self.nbits = 0;
         }
         Ok(&mut self.writer)
-    }
-
-    pub fn get_ref(&self) -> &W {
-        &self.writer
-    }
-
-    pub fn get_mut(&mut self) -> &mut W {
-        &mut self.writer
-    }
-
-    pub fn take(self) -> W {
-        debug_assert_eq!(self.nbits, 0);
-        self.writer
     }
 }

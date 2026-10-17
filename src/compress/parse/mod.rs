@@ -8,6 +8,10 @@ pub(crate) use greedy::*;
 pub(crate) use lazy::*;
 pub(crate) use rle::*;
 
+pub(super) const SYMBOL_LIMIT: usize = 16384;
+// A lazy-parser iteration can append two literal/match pairs before checking.
+const SYMBOL_CAPACITY: usize = SYMBOL_LIMIT + 4;
+
 use crate::compress::{
     bitstream::{self, Symbol},
     matchfinder::{rle_match, Match, MatchFinder},
@@ -24,23 +28,45 @@ struct ParserInner<M> {
     last_match: usize,
     last_block_end: usize,
     last_index: u32,
+    // Preserve match-search skipping across automatic block boundaries. This
+    // score is capped independently of stream length and absolute indices.
+    literal_streak: usize,
 }
 impl<M: MatchFinder> ParserInner<M> {
     fn new(skip_ahead_shift: u8, match_finder: M) -> Self {
         Self {
             match_finder,
             skip_ahead_shift,
-            symbols: Vec::new(),
+            symbols: Vec::with_capacity(SYMBOL_CAPACITY),
             ip: 0,
             last_match: 0,
             last_block_end: 0,
             last_index: 0,
+            literal_streak: 0,
         }
     }
 
     fn reset_indices(&mut self, old_base_index: u32) {
-        self.last_match -= old_base_index as usize;
+        // Parser positions are relative to the input slice. Only absolute table
+        // indices and literal ranges change when rebasing the stream.
+        self.last_index -= old_base_index;
+        for symbol in &mut self.symbols {
+            if let Symbol::LiteralRun { start, end } = symbol {
+                *start -= old_base_index;
+                *end -= old_base_index;
+            }
+        }
         self.match_finder.reset_indices(old_base_index);
+    }
+
+    fn reset(&mut self) {
+        self.match_finder.clear();
+        self.symbols.clear();
+        self.ip = 0;
+        self.last_match = 0;
+        self.last_block_end = 0;
+        self.last_index = 0;
+        self.literal_streak = 0;
     }
 
     fn start_compress(&mut self, data: &[u8], base_index: u32, start: usize) -> usize {
@@ -92,7 +118,7 @@ impl<M: MatchFinder> ParserInner<M> {
 
             // If we haven't found a match in a while, start skipping ahead by emitting
             // multiple literals at once.
-            self.ip += (self.ip - self.last_match) >> self.skip_ahead_shift;
+            self.ip += (self.ip - self.last_match + self.literal_streak) >> self.skip_ahead_shift;
         }
 
         Match::empty()
@@ -113,6 +139,7 @@ impl<M: MatchFinder> ParserInner<M> {
     #[inline(always)]
     fn insert_match(&mut self, base_index: u32, m: Match) {
         assert!(self.last_match <= m.start);
+        debug_assert!(self.symbols.len() + 2 <= SYMBOL_CAPACITY);
         if m.start > self.last_match {
             self.symbols.push(Symbol::LiteralRun {
                 start: base_index + self.last_match as u32,
@@ -125,6 +152,7 @@ impl<M: MatchFinder> ParserInner<M> {
             dist_sym: bitstream::distance_to_dist_sym(m.distance),
         });
         self.last_match = m.end();
+        self.literal_streak = 0;
     }
 
     #[inline(always)]
@@ -136,7 +164,7 @@ impl<M: MatchFinder> ParserInner<M> {
         flush: Flush,
     ) -> io::Result<()> {
         // Write the block if we have enough symbols.
-        if self.symbols.len() >= 16384 {
+        if self.symbols.len() >= SYMBOL_LIMIT {
             let last_block = flush == Flush::Finish && self.last_match == data.len();
             bitstream::write_block(
                 writer,
@@ -167,10 +195,13 @@ impl<M: MatchFinder> ParserInner<M> {
 
             // Append a final literal run if there's remaining input.
             if self.last_match < data.len() {
+                debug_assert!(self.symbols.len() < SYMBOL_CAPACITY);
                 self.symbols.push(Symbol::LiteralRun {
                     start: base_index + self.last_match as u32,
                     end: base_index + data.len() as u32,
                 });
+                self.literal_streak =
+                    (self.literal_streak + data.len() - self.last_match).min(1024 * 1024);
                 self.ip = data.len();
                 self.last_match = data.len();
             }
@@ -189,6 +220,10 @@ impl<M: MatchFinder> ParserInner<M> {
         }
 
         let consumed = self.last_block_end - start;
+
+        if !matches!(flush, Flush::None | Flush::Block) {
+            self.literal_streak = 0;
+        }
 
         if flush == Flush::Full {
             self.match_finder.clear();

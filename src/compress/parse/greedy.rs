@@ -12,6 +12,10 @@ pub(crate) struct GreedyParser<M> {
 }
 
 impl<M: MatchFinder> GreedyParser<M> {
+    pub fn reset(&mut self) {
+        self.inner.reset();
+        self.m = Match::empty();
+    }
     pub fn new(skip_ahead_shift: u8, match_finder: M) -> Self {
         Self {
             inner: ParserInner::new(skip_ahead_shift, match_finder),

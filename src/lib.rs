@@ -28,7 +28,8 @@ mod tables;
 
 pub use compress::{
     compress_to_vec, compress_to_vec_rle, compress_to_vec_ultra_fast, compress_to_vec_with_level,
-    Compressor, FlushKind, UltraFastCompressor,
+    CompressionError, CompressionFlush, CompressionProgress, CompressionStatus, Compressor,
+    FlushKind, StreamingCompressor, UltraFastCompressor,
 };
 pub use decompress::{
     decompress_to_vec, decompress_to_vec_bounded, BoundedDecompressionError, DecompressionError,
