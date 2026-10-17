@@ -83,6 +83,8 @@ impl BlockHeader {
 pub const LITERAL_ENTRY: u32 = 0x8000;
 pub const EXCEPTIONAL_ENTRY: u32 = 0x4000;
 pub const SECONDARY_TABLE_ENTRY: u32 = 0x2000;
+// Reserved fixed-tree symbols 286 and 287 have code lengths but are not EOF.
+pub const INVALID_ENTRY: u32 = 0x1000;
 
 // See https://github.com/image-rs/fdeflate/issues/45 for discussion of the table sizes.
 const DEFAULT_LITLEN_TABLE_SIZE: usize = 4096;
@@ -934,13 +936,14 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
                             bit_buffer.consume_bits(litlen_code_bits);
                             return Ok((CompressedBlockStatus::ReachedEndOfBlock, output_index));
                         }
-                        _ => (
+                        257..=285 => (
                             LEN_SYM_TO_LEN_BASE[litlen_symbol as usize - 257] as u32,
                             LEN_SYM_TO_LEN_EXTRA[litlen_symbol as usize - 257],
                             litlen_code_bits,
                         ),
+                        _ => return Err(DecompressionError::InvalidLiteralLengthCode),
                     }
-                } else if litlen_code_bits == 0 {
+                } else if litlen_code_bits == 0 || litlen_entry & INVALID_ENTRY != 0 {
                     return Err(DecompressionError::InvalidLiteralLengthCode);
                 } else {
                     bit_buffer.consume_bits(litlen_code_bits);
@@ -1102,6 +1105,8 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
                         } else if litlen_symbol == 256 {
                             bit_buffer.consume_bits(litlen_code_bits);
                             return Ok((CompressedBlockStatus::ReachedEndOfBlock, output_index));
+                        } else if litlen_symbol > 285 {
+                            return Err(DecompressionError::InvalidLiteralLengthCode);
                         }
 
                         (
@@ -1114,6 +1119,9 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
                     } else {
                         if bit_buffer.nbits < litlen_code_bits {
                             break;
+                        }
+                        if litlen_entry & INVALID_ENTRY != 0 {
+                            return Err(DecompressionError::InvalidLiteralLengthCode);
                         }
                         bit_buffer.consume_bits(litlen_code_bits);
                         return Ok((CompressedBlockStatus::ReachedEndOfBlock, output_index));
