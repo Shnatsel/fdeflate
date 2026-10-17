@@ -14,6 +14,10 @@ impl<W: Write> BitWriter<W> {
         }
     }
 
+    pub fn buffered_bits(&self) -> u8 {
+        self.nbits
+    }
+
     #[inline(always)]
     pub fn write_bits(&mut self, bits: u64, nbits: u8) -> io::Result<()> {
         debug_assert!(nbits <= 64);
