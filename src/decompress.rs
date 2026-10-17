@@ -386,7 +386,7 @@ impl Decompressor {
 
                     let align_bits = self.bits.nbits % 8;
                     if self.bits.nbits >= 32 + align_bits {
-                        self.checksum.write(&output[output_position..output_index]);
+                        self.update_checksum(output, output_position, output_index);
                         if align_bits != 0 {
                             self.bits.consume_bits(align_bits);
                         }
@@ -1434,6 +1434,36 @@ mod tests {
         assert_eq!(output_written, 0);
 
         assert_eq!(&decompressed[..input.len()], input);
+    }
+
+    #[test]
+    fn checksum_includes_queued_output() {
+        let input = vec![42; 2048];
+        let compressed = crate::compress_to_vec_rle(&input);
+
+        let mut decompressor = Decompressor::new();
+        let mut decompressed = vec![0; input.len()];
+        let mut input_index = 0;
+        let mut output_index = 0;
+
+        while !decompressor.is_done() {
+            let output_end = (output_index + 16).min(decompressed.len());
+            let (input_consumed, output_written) = decompressor
+                .read(
+                    &compressed[input_index..],
+                    &mut decompressed[..output_end],
+                    output_index,
+                )
+                .unwrap();
+
+            assert!(input_consumed != 0 || output_written != 0 || decompressor.is_done());
+            input_index += input_consumed;
+            output_index += output_written;
+        }
+
+        assert_eq!(input_index, compressed.len());
+        assert_eq!(output_index, input.len());
+        assert_eq!(decompressed, input);
     }
 
     #[test]
