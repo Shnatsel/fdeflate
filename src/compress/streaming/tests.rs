@@ -58,7 +58,7 @@ fn compress(
 
 #[test]
 fn cross_decoder_levels_chunking_and_history() {
-    let mut input = random(BLOCK_SIZE * 2 + 317);
+    let mut input = random(BATCH_SIZE * 2 + 317);
     // Exercise distant references across automatic block boundaries.
     for i in 32768..input.len() {
         if i % 131 < 100 {
@@ -79,14 +79,14 @@ fn cross_decoder_levels_chunking_and_history() {
             }
         }
         let mut encoder = StreamingCompressor::new_rle(zlib);
-        let input = vec![0; BLOCK_SIZE * 3];
+        let input = vec![0; BATCH_SIZE * 3];
         assert_eq!(decode(&compress(&mut encoder, &input, 7, 1), zlib), input);
     }
 }
 
 #[test]
 fn incompressible_stream_is_bounded_and_emitted_before_finish() {
-    let input = random(BLOCK_SIZE);
+    let input = random(BATCH_SIZE);
     let mut encoder = StreamingCompressor::new(6, false);
     let capacities = (encoder.input.data.capacity(), encoder.pending.capacity());
     let mut output = vec![0; OUTPUT_CAPACITY];
@@ -169,7 +169,7 @@ fn flush_request_survives_zero_output_and_none_retry() {
 
 #[test]
 fn frequent_rebasing_preserves_hash_chain_slots() {
-    let mut input = random(BLOCK_SIZE * 5);
+    let mut input = random(BATCH_SIZE * 5);
     for i in 32768..input.len() {
         input[i] = input[i - 32768];
     }
@@ -200,7 +200,7 @@ fn frequent_rebasing_preserves_hash_chain_slots() {
 #[test]
 fn reset_discards_pending_output_and_retains_allocations() {
     let mut encoder = StreamingCompressor::new(6, true);
-    let input = random(BLOCK_SIZE * 2);
+    let input = random(BATCH_SIZE * 2);
     encoder.process(&input, &mut [0; 3], CompressionFlush::Finish);
     let capacities = (encoder.input.data.capacity(), encoder.pending.capacity());
     for zlib in [false, true] {
@@ -225,13 +225,13 @@ fn reset_discards_pending_output_and_retains_allocations() {
 #[test]
 #[ignore = "processes more than 4 GiB; run explicitly in release mode"]
 fn long_stream_rebases_without_overflow() {
-    let input = vec![b'A'; BLOCK_SIZE];
+    let input = vec![b'A'; BATCH_SIZE];
     for level in [0, 1, 6] {
         let mut encoder = StreamingCompressor::new(level, false);
         let mut output = vec![0; OUTPUT_CAPACITY];
         let mut decoder =
             miniz_oxide::inflate::stream::InflateState::new_boxed(miniz_oxide::DataFormat::Raw);
-        let mut decoded = vec![0; BLOCK_SIZE + 258];
+        let mut decoded = vec![0; BATCH_SIZE + 258];
         let mut total_decoded = 0u64;
         let mut verify = |bytes: &[u8], finished: bool| {
             let mut position = 0;
@@ -259,7 +259,7 @@ fn long_stream_rebases_without_overflow() {
             assert_eq!(position, bytes.len());
         };
         let mut count = 0u64;
-        for _ in 0..(u32::MAX as u64 / BLOCK_SIZE as u64 + 3) {
+        for _ in 0..(u32::MAX as u64 / BATCH_SIZE as u64 + 3) {
             let p = encoder.process(&input, &mut output, CompressionFlush::None);
             assert_eq!(p.consumed, input.len());
             assert_eq!(p.status.unwrap(), CompressionStatus::NeedsInput);
@@ -276,7 +276,7 @@ fn long_stream_rebases_without_overflow() {
 
 #[test]
 fn pending_flush_can_be_upgraded_without_losing_input() {
-    let input = random(BLOCK_SIZE);
+    let input = random(BATCH_SIZE);
     for level in [0, 1, 6, 9] {
         let mut encoder = StreamingCompressor::new(level, false);
         let mut encoded = Vec::new();
@@ -308,7 +308,7 @@ fn every_flush_exposes_all_input_before_finishing() {
             CompressionFlush::Sync,
             CompressionFlush::Full,
         ] {
-            for size in [1, 258, BLOCK_SIZE - 1, BLOCK_SIZE + 1] {
+            for size in [1, 258, BATCH_SIZE - 1, BATCH_SIZE + 1] {
                 let input = random(size);
                 let mut encoder = StreamingCompressor::new(level, false);
                 let mut encoded = Vec::new();

@@ -221,7 +221,7 @@ impl<M: MatchFinder> ParserInner<M> {
 
         let consumed = self.last_block_end - start;
 
-        if !matches!(flush, Flush::None | Flush::Block) {
+        if !matches!(flush, Flush::None | Flush::Batch) {
             self.literal_streak = 0;
         }
 

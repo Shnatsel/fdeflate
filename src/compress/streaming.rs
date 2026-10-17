@@ -12,14 +12,14 @@ use super::{
     RleParser, WINDOW_SIZE,
 };
 
-const BLOCK_SIZE: usize = 128 * 1024;
-const INPUT_CAPACITY: usize = WINDOW_SIZE + BLOCK_SIZE;
+const BATCH_SIZE: usize = 128 * 1024;
+const INPUT_CAPACITY: usize = WINDOW_SIZE + BATCH_SIZE;
 // Each symbol describes at least one input byte. Symbol-triggered blocks have
 // at least 16384 symbols, and each may need an additional stored block header.
 // Reserve headers for those splits, the 65535-byte stored-block limit, and all
 // wrapper/flush framing. Every block chooses an encoding no larger than stored.
 const OUTPUT_CAPACITY: usize =
-    BLOCK_SIZE + 5 * (BLOCK_SIZE / 65535 + BLOCK_SIZE / SYMBOL_LIMIT + 3) + 64;
+    BATCH_SIZE + 5 * (BATCH_SIZE / 65535 + BATCH_SIZE / SYMBOL_LIMIT + 3) + 64;
 
 #[cfg(test)]
 mod tests;
@@ -299,7 +299,7 @@ impl StreamingCompressor {
             }
 
             let buffered = self.input.data.len() - self.input.written;
-            let n = (BLOCK_SIZE - buffered).min(input.len() - consumed);
+            let n = (BATCH_SIZE - buffered).min(input.len() - consumed);
             if self.input.data.len() + n > INPUT_CAPACITY {
                 // Rebase by a multiple of WINDOW_SIZE: hash-chain ring slots
                 // must keep the same index modulo WINDOW_SIZE after rebasing.
@@ -319,9 +319,9 @@ impl StreamingCompressor {
             if consumed == input.len() {
                 self.request(flush);
             }
-            if self.requested.is_none() && self.input.data.len() - self.input.written == BLOCK_SIZE
+            if self.requested.is_none() && self.input.data.len() - self.input.written == BATCH_SIZE
             {
-                self.emit(output, &mut produced, Flush::Block);
+                self.emit(output, &mut produced, Flush::Batch);
             }
         };
         CompressionProgress {
@@ -398,7 +398,7 @@ fn encode_batch<W: Write>(
                 .write_all(&checksum.finish().to_be_bytes())
                 .expect("infallible destination");
         }
-    } else if flush == Flush::Block {
+    } else if flush == Flush::Batch {
         // Release complete bytes without alignment or an extra flush block.
         writer.partial_flush().expect("infallible destination");
     }

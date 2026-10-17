@@ -29,7 +29,7 @@ const WINDOW_SIZE: usize = 32768;
 #[non_exhaustive]
 enum Flush {
     None,
-    Block,
+    Batch,
     Partial,
     Full,
     Sync,
