@@ -429,7 +429,7 @@ impl Decompressor {
     }
 
     fn update_checksum(&mut self, output: &[u8], start: usize, end: usize) {
-        if self.format == Format::Zlib && !self.ignore_adler32 && self.state != State::Done {
+        if !self.ignore_adler32 && self.state != State::Done {
             self.checksum.write(&output[start..end]);
         }
     }
@@ -1103,8 +1103,8 @@ impl<const LITLEN_TABLE_SIZE: usize, const DIST_TABLE_SIZE: usize>
         }
 
         if queued_output.is_none()
-            && bit_buffer.nbits >= 15
-            && bit_buffer.peek_bits(15) as u16 & self.eof_mask == self.eof_code
+            && bit_buffer.nbits >= self.eof_bits
+            && bit_buffer.peek_bits(self.eof_bits) as u16 == self.eof_code
         {
             bit_buffer.consume_bits(self.eof_bits);
             return Ok((CompressedBlockStatus::ReachedEndOfBlock, output_index));
@@ -1519,6 +1519,18 @@ mod tests {
         assert!(decompressor.is_done());
         assert_eq!(input_consumed, compressed.len());
         assert_eq!(&output[..output_written], input);
+    }
+
+    #[test]
+    fn raw_end_marker_with_exact_output() {
+        // A fixed block containing one literal zero and its seven-bit end marker. There is no
+        // zlib checksum to supply extra lookahead after the output buffer fills.
+        let compressed = [0x63, 0, 0];
+        let mut decompressor = Decompressor::new_with_format(Format::Raw);
+        let mut output = [0xff];
+        assert_eq!(decompressor.read(&compressed, &mut output, 0), Ok((3, 1)));
+        assert!(decompressor.is_done());
+        assert_eq!(output, [0]);
     }
 
     #[test]
